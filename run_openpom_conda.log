@@ -1,0 +1,9 @@
+Loading raw OpenPOM CSVs...
+Traceback (most recent call last):
+  File "/Users/igboprincess/projects/olfactory-flavour-datasets-suds/src/preprocessing/standardize_openpom.py", line 275, in <module>
+    main()
+  File "/Users/igboprincess/projects/olfactory-flavour-datasets-suds/src/preprocessing/standardize_openpom.py", line 159, in main
+    df = load_raw_csvs(RAW_DIR)
+  File "/Users/igboprincess/projects/olfactory-flavour-datasets-suds/src/preprocessing/standardize_openpom.py", line 142, in load_raw_csvs
+    raise FileNotFoundError(f"No CSV files found in {raw_dir}")
+FileNotFoundError: No CSV files found in data/raw/openpom
