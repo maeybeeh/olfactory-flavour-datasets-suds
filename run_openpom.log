@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/Users/igboprincess/projects/olfactory-flavour-datasets-suds/src/preprocessing/standardize_openpom.py", line 27, in <module>
+    from rdkit import Chem
+ModuleNotFoundError: No module named 'rdkit'
