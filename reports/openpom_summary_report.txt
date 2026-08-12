@@ -1,0 +1,14 @@
+
+##  OpenPOM Datacard: Summary Report
+
+###  1. Data Integrity & Quality
+- **Completeness**: The missingness map shows a highly robust dataset with minimal gaps in key molecular descriptors.
+- **Signal Strength**: High-entropy descriptors like **logP** and **MW** provide strong discriminatory power for olfactory modeling, while sparse descriptors identify rare but specific scent profiles.
+
+###  2. Chemical Space Positioning (OTDD)
+- **Olfactory Consistency**: OpenPOM shows the strongest structural similarity to the **Leffingwell** dataset (Distance: 4.25), validating its relevance for fragrance research.
+- **Diversity**: It maintains a healthy structural distance from **Delaney** (Distance: 5.39), confirming it samples a chemical space distinct from typical solubility-focused datasets.
+
+###  3. Activity Cliffs & Model Challenges
+- **Identified Cliffs**: Found **114 pairs** of molecules with ≥85% Tanimoto similarity but ≤20% scent overlap.
+- **Key Finding**: Stereoisomers and small functional group shifts (e.g., in Sandalwood-like structures) represent the primary 'blind spots' where structural similarity does not guarantee functional similarity.
