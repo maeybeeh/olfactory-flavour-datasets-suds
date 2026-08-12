@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+standardize_openpom.py
+
+Preprocess OpenPOM (GoodScents / Leffingwell) CSVs into a single, cleaned,
+ML-ready CSV: data/processed/openpom_processed.csv
+
+Dependencies:
+  - pandas
+  - numpy
+  - rdkit
+  - scikit-learn (for MultiLabelBinarizer)
+  - pubchempy (optional, for name->SMILES fallback)
+
+Run:
+  python src/preprocessing/standardize_openpom.py
+"""
+
+import os
+import glob
+import re
+from collections import Counter, defaultdict
+
+import pandas as pd
+import numpy as np
+
+from rdkit import Chem
+from rdkit.Chem import Descriptors, rdMolDescriptors, Crippen
+from rdkit.Chem.AllChem import GetMorganFingerprintAsBitVect
+from sklearn.preprocessing import MultiLabelBinarizer
+
+# Optional PubChem fallback
+try:
+    import pubchempy as pcp
+    PUBCHEM_AVAILABLE = True
+except Exception:
+    PUBCHEM_AVAILABLE = False
+
+RAW_DIR = "data/raw/openpom"
+OUT_DIR = "data/processed"
+OUT_PATH = os.path.join(OUT_DIR, "openpom_processed.csv")
+
+# Parameters
+FINGERPRINT_BITS = 2048
+FINGERPRINT_RADIUS = 2
+TOP_N_DESCRIPTORS = 50
+QUALITY_AMBIGUOUS_TOKENS = {"trace", "unknown", "not reported", "nr", "n/a", "none"}
+
+# Simple synonyms map (extend as needed)
+SYNONYMS = {
+    "fruity": {"fruit", "fruity"},
+    "floral": {"floral", "flower", "flowery"},
+    "citrus": {"citrus", "lemon", "orange", "lime"},
+    "woody": {"woody", "wood"},
+    "green": {"green", "vegetative"},
+    "sweet": {"sweet", "sugary"},
+}
+
+def normalize_descriptor_token(tok):
+    tok = tok.lower().strip()
+    tok = re.sub(r"[^\w\s\-]", "", tok)
+    tok = re.sub(r"\s+", " ", tok)
+    for canon, variants in SYNONYMS.items():
+        if tok in variants:
+            return canon
+    return tok
+
+def split_descriptors(text):
+    if pd.isna(text):
+        return []
+    parts = re.split(r"[;,/|]| and | & ", str(text))
+    tokens = [normalize_descriptor_token(p) for p in parts if p and p.strip()]
+    tokens = [t for t in tokens if t not in {"", "-", "?"}]
+    return tokens
+
+def smiles_from_name_via_pubchem(name):
+    if not PUBCHEM_AVAILABLE:
+        return None
+    try:
+        results = pcp.get_compounds(name, 'name')
+        if results:
+            return results[0].canonical_smiles
+    except Exception:
+        return None
+    return None
+
+def canonicalize_smiles(smiles_or_name, cas=None):
+    if pd.isna(smiles_or_name) or smiles_or_name is None:
+        smiles_or_name = ""
+    s = str(smiles_or_name).strip()
+    if any(ch in s for ch in ("=", "#", "(", ")", "[", "]", "@", "C", "c", "O", "N", "S")):
+        try:
+            mol = Chem.MolFromSmiles(s)
+            if mol:
+                return Chem.MolToSmiles(mol, isomericSmiles=True)
+        except Exception:
+            pass
+    if s and PUBCHEM_AVAILABLE:
+        try:
+            smi = smiles_from_name_via_pubchem(s)
+            if smi:
+                mol = Chem.MolFromSmiles(smi)
+                if mol:
+                    return Chem.MolToSmiles(mol, isomericSmiles=True)
+        except Exception:
+            pass
+    if cas and PUBCHEM_AVAILABLE:
+        try:
+            results = pcp.get_compounds(cas, 'name')
+            if results:
+                smi = results[0].canonical_smiles
+                mol = Chem.MolFromSmiles(smi)
+                if mol:
+                    return Chem.MolToSmiles(mol, isomericSmiles=True)
+        except Exception:
+            pass
+    return None
+
+def fingerprint_bitstring(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    fp = GetMorganFingerprintAsBitVect(mol, FINGERPRINT_RADIUS, nBits=FINGERPRINT_BITS)
+    bits = list(fp.ToBitString())
+    return "".join(bits)
+
+def compute_rdkit_features(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return {}
+    return {
+        "MW": Descriptors.MolWt(mol),
+        "TPSA": rdMolDescriptors.CalcTPSA(mol),
+        "logP": Crippen.MolLogP(mol),
+        "RB": Descriptors.NumRotatableBonds(mol),
+        "AROM": rdMolDescriptors.CalcNumAromaticRings(mol)
+    }
+
+def load_raw_csvs(raw_dir):
+    files = glob.glob(os.path.join(raw_dir, "*.csv"))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
+    dfs = []
+    for f in files:
+        try:
+            df = pd.read_csv(f, dtype=str, low_memory=False)
+            df["__source_file"] = os.path.basename(f)
+            dfs.append(df)
+        except Exception as e:
+            print(f"Warning: failed to read {f}: {e}")
+    if not dfs:
+        raise RuntimeError("No readable CSVs found.")
+    return pd.concat(dfs, ignore_index=True, sort=False)
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("Loading raw OpenPOM CSVs...")
+    df = load_raw_csvs(RAW_DIR)
+
+    colmap = {}
+    for c in df.columns:
+        lc = c.lower()
+        if "smiles" in lc:
+            colmap[c] = "SMILES"
+        elif "name" == lc or "compound" in lc:
+            colmap[c] = "Compound_Name"
+        elif "cas" in lc:
+            colmap[c] = "CAS"
+        elif "descriptor" in lc or "odor" in lc or "note" in lc:
+            colmap[c] = "Descriptors"
+        elif "source" in lc:
+            colmap[c] = "Source"
+        elif "id" == lc or "row" in lc:
+            colmap[c] = "Original_ID"
+        elif "mw" in lc or "molecular weight" in lc:
+            colmap[c] = "MW"
+    df = df.rename(columns=colmap)
+
+    for col in ["SMILES", "Compound_Name", "CAS", "Descriptors", "Original_ID", "__source_file"]:
+        if col not in df.columns:
+            df[col] = np.nan
+#unify descriptor columns BEFORE tokenizing
+# --- UNIFY DESCRIPTOR COLUMN NAMES ---
+
+    possible_descriptor_cols = [
+    "descriptors",
+    "Updated_Desc",
+    "Updated_Desc_v2",
+    "Descriptor",
+    "Odor",
+    "Odor_Description",
+    "notes"
+]
+
+found = None
+for col in possible_descriptor_cols:
+    if col in df.columns:
+        found = col
+        break
+
+ if found:
+    df["descriptors"] = df[found].astype(str)
+
+    # --- UNIFY DESCRIPTOR COLUMN NAMES ---
+    possible_descriptor_cols = [
+        "descriptors",
+        "Updated_Desc",
+        "Updated_Desc_v2",
+        "Descriptor",
+        "Odor",
+        "Odor_Description",
+        "notes"
+    ]
+
+    found = None
+    for col in possible_descriptor_cols:
+        if col in df.columns:
+            found = col
+            break
+
+    if found:
+        df["descriptors"] = df[found].astype(str)
+    else:
+        df["descriptors"] = ""
+    print("Tokenizing descriptors...")
+    df["descriptors_list"] = df["descriptors"].apply(split_descriptors)
+    df["descriptors_raw"] = df["descriptors"].astype(str)
+
+    print("Tokenizing descriptors...")
+    df["descriptors_list"] = df["descriptors"].apply(split_descriptors)
+    df["descriptors_raw"] = df["descriptors"].astype(str)
+
+    def quality_flag(tokens):
+        if not tokens:
+            return "missing"
+        if any(tok in QUALITY_AMBIGUOUS_TOKENS for tok in tokens):
+            return "ambiguous"
+        return "ok"
+    df["quality_flag"] = df["descriptors_list"].apply(quality_flag)
+
+    print("Canonicalizing SMILES (RDKit + optional PubChem fallback)...")
+    df["canonical_smiles"] = df.apply(
+        lambda r: canonicalize_smiles(r.get("SMILES", ""), cas=r.get("CAS", None)) or canonicalize_smiles(r.get("Compound_Name", ""), cas=r.get("CAS", None)),
+        axis=1
+    )
+
+    before = len(df)
+    df = df.dropna(subset=["canonical_smiles"]).reset_index(drop=True)
+    print(f"Dropped {before - len(df)} rows with no valid SMILES.")
+
+    print("Computing RDKit features and fingerprints...")
+    feats = df["canonical_smiles"].apply(compute_rdkit_features)
+    feats_df = pd.DataFrame(feats.tolist()).fillna(np.nan)
+    df = pd.concat([df, feats_df], axis=1)
+
+    df["fingerprint"] = df["canonical_smiles"].apply(fingerprint_bitstring)
+
+    before = len(df)
+    df = df.dropna(subset=["fingerprint"]).reset_index(drop=True)
+    print(f"Dropped {before - len(df)} rows with invalid fingerprint.")
+
+    print("Building descriptor vocabulary...")
+    all_tokens = Counter()
+    for tokens in df["descriptors_list"]:
+        all_tokens.update(tokens)
+    if "" in all_tokens:
+        del all_tokens[""]
+    top_descriptors = [t for t, _ in all_tokens.most_common(TOP_N_DESCRIPTORS)]
+    print(f"Top {len(top_descriptors)} descriptors: {top_descriptors[:10]} ...")
+
+    mlb = MultiLabelBinarizer(classes=top_descriptors)
+    multi_hot = mlb.fit_transform(df["descriptors_list"])
+    multi_hot_df = pd.DataFrame(multi_hot, columns=[f"desc_{c}" for c in mlb.classes_])
+    df = pd.concat([df, multi_hot_df], axis=1)
+
+    print("Aggregating duplicates by canonical_smiles...")
+    def aggregate_descriptors(series):
+        union = set()
+        for lst in series:
+            union.update(lst)
+        return sorted(union)
+
+    agg_dict = {
+        "Compound_Name": "first",
+        "CAS": "first",
+        "Original_ID": lambda s: ";".join(s.dropna().astype(str).unique()),
+        "__source_file": lambda s: ";".join(s.dropna().astype(str).unique()),
+        "descriptors_raw": lambda s: ";".join(s.dropna().astype(str).unique()),
+        "descriptors_list": aggregate_descriptors,
+        "quality_flag": lambda s: ";".join(sorted(set(s))),
+        "fingerprint": "first",
+        "MW": "median",
+        "TPSA": "median",
+        "logP": "median",
+        "RB": "median",
+        "AROM": "median"
+    }
+    for col in multi_hot_df.columns:
+        agg_dict[col] = "max"
+
+    grouped = df.groupby("canonical_smiles").agg(agg_dict).reset_index()
+
+    desc_cols = [c for c in grouped.columns if c.startswith("desc_")]
+    grouped[desc_cols] = grouped[desc_cols].fillna(0).astype(int)
+
+    cols = [
+        "canonical_smiles", "Compound_Name", "CAS", "Original_ID", "__source_file",
+        "descriptors_raw", "descriptors_list", "quality_flag",
+        "MW", "TPSA", "logP", "RB", "AROM", "fingerprint"
+    ] + desc_cols
+
+    grouped = grouped[cols]
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    grouped.to_csv(OUT_PATH, index=False)
+    print(f"Saved processed OpenPOM to: {OUT_PATH}")
+    print("Rows:", len(grouped))
+
+if __name__ == "__main__":
+    main()
+
+
+
